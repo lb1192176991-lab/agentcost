@@ -43,18 +43,23 @@ def _format_currency(n: float) -> str:
         return f"${n:,.2f}"
 
 
-def _parse_all_logs(log_paths: Optional[List[Path]] = None, *, strict: bool = False) -> List[TokenUsage]:
+def _parse_all_logs(
+    log_paths: Optional[List[Path]] = None,
+    *,
+    strict: bool = False,
+    agent: Optional[str] = None,
+) -> List[TokenUsage]:
     """Parse all logs from given paths or auto-discover."""
     all_usages = []
 
     if log_paths:
         for path in log_paths:
             if path.is_file():
-                all_usages.extend(_parse_file(path, strict=strict))
+                all_usages.extend(_parse_file(path, strict=strict, agent=agent))
             elif path.is_dir():
                 for subpath in path.rglob("*"):
                     if subpath.is_file() and subpath.suffix in (".jsonl", ".json", ".log"):
-                        all_usages.extend(_parse_file(subpath, strict=strict))
+                        all_usages.extend(_parse_file(subpath, strict=strict, agent=agent))
     else:
         # First, try SQLite database (Hermes agent)
         sqlite_parser = HermesSQLiteParser()
@@ -74,19 +79,119 @@ def _parse_all_logs(log_paths: Optional[List[Path]] = None, *, strict: bool = Fa
     return all_usages
 
 
-def _parse_file(path: Path, strict: bool = False) -> List[TokenUsage]:
-    """Parse a single file, choosing parser by path."""
+# Concrete agent types grouped by their structural log format. The path-based
+# heuristic and content detection can only tell families apart reliably
+# (Claude/Cursor both wrap usage under "message"; Codex/OpenCode both put it at
+# the top level), so they resolve within a family via the more specific hint.
+_AGENT_FAMILY = {
+    "claude": "claude",
+    "cursor": "claude",
+    "codex": "codex",
+    "opencode": "codex",
+    "hermes": "hermes",
+}
+
+# When structural detection disagrees with the path and there is no more
+# specific signal available, this maps a detected family back to a concrete
+# parser.
+_FAMILY_DEFAULT = {
+    "claude": "claude",
+    "codex": "codex",
+    "hermes": "hermes",
+}
+
+
+def _agent_from_path(path: Path) -> str:
+    """Guess the agent type from the file path (heuristic fallback)."""
     path_lower = str(path).lower()
-    if "claude" in path_lower:
-        parser = ClaudeCodeParser()
-    elif "cursor" in path_lower:
-        parser = CursorParser()
-    elif "codex" in path_lower:
-        parser = CodexParser()
-    elif "opencode" in path_lower:
-        parser = OpenCodeParser()
-    else:
-        parser = HermesParser()
+    for agent in ("claude", "cursor", "codex", "opencode"):
+        if agent in path_lower:
+            return agent
+    return "hermes"
+
+
+def _classify_entry(entry) -> Optional[str]:
+    """Classify one JSON log entry into a canonical agent family.
+
+    Returns ``"claude"`` for message-wrapped usage (Claude/Cursor),
+    ``"codex"`` for top-level usage (Codex/OpenCode), ``"hermes"`` for the
+    Hermes message shape, or ``None`` when the format is unrecognised.
+    """
+    if not isinstance(entry, dict):
+        return None
+    message = entry.get("message")
+    if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+        return "claude"
+    usage = entry.get("usage")
+    tokens = entry.get("tokens")
+    if isinstance(usage, dict) or isinstance(tokens, dict):
+        if "type" in entry or "role" in entry or "content" in entry:
+            return "hermes"
+        return "codex"
+    return None
+
+
+def _detect_agent_from_content(path: Path) -> Optional[str]:
+    """Peek at the first non-empty JSON lines to detect the log format.
+
+    Returns a canonical agent family (``"claude"``, ``"codex"`` or
+    ``"hermes"``) or ``None`` when the format cannot be determined.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            checked = 0
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                family = _classify_entry(entry)
+                if family:
+                    return family
+                checked += 1
+                if checked >= 10:
+                    break
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None
+
+
+def _resolve_parser_type(path: Path, explicit_agent: Optional[str] = None) -> str:
+    """Choose the parser type for a single log file.
+
+    Priority: an explicit ``--agent`` flag, then structural content detection,
+    then the path-based heuristic. When structural detection disagrees with the
+    path heuristic, a warning is printed to stderr and structural detection
+    wins.
+    """
+    if explicit_agent:
+        return explicit_agent
+
+    path_agent = _agent_from_path(path)
+    detected_family = _detect_agent_from_content(path)
+
+    if detected_family is None:
+        return path_agent
+
+    if _AGENT_FAMILY.get(path_agent) == detected_family:
+        # Same family — trust the more specific path hint (cursor vs claude).
+        return path_agent
+
+    print(
+        f"Warning: {path} looks like a {path_agent} log by path but its "
+        f"content matches the {detected_family} format; using {detected_family}.",
+        file=sys.stderr,
+    )
+    return _FAMILY_DEFAULT[detected_family]
+
+
+def _parse_file(path: Path, strict: bool = False, agent: Optional[str] = None) -> List[TokenUsage]:
+    """Parse a single file, choosing the parser by structural detection."""
+    agent_type = _resolve_parser_type(path, agent)
+    parser = _get_parser(agent_type)
     if isinstance(parser, CursorParser):
         return parser.parse(path, strict=strict)
     return parser.parse(path)
@@ -175,12 +280,14 @@ def discover(log_paths, agent, quiet=False):
 @cli.command()
 @click.option("--path", "-p", "log_paths", multiple=True, type=click.Path(path_type=Path),
               help="Custom log paths")
+@click.option("--agent", "-a", default=None, type=click.Choice(["claude", "codex", "opencode", "hermes", "cursor"]),
+              help="Force a specific agent parser, overriding auto-detection")
 @click.option("--date", default=None, help="Date to show (YYYY-MM-DD, default: today)")
 @click.option("--json-output", "json_out", is_flag=True, help="Output as JSON")
 @click.option("--quiet", "-q", is_flag=True, help="Suppress rich formatting and output JSON only")
-def today(log_paths, date, json_out, quiet=False):
+def today(log_paths, agent, date, json_out, quiet=False):
     """Show today's token usage (or a specific date with --date)."""
-    usages = _parse_all_logs(list(log_paths) if log_paths else None)
+    usages = _parse_all_logs(list(log_paths) if log_paths else None, agent=agent)
     
     from datetime import datetime, timedelta
     if date:
@@ -238,13 +345,15 @@ def today(log_paths, date, json_out, quiet=False):
 @click.option("--date", default=None, help="End date (YYYY-MM-DD, default: today)")
 @click.option("--path", "-p", "log_paths", multiple=True, type=click.Path(path_type=Path),
               help="Custom log paths")
+@click.option("--agent", "-a", default=None, type=click.Choice(["claude", "codex", "opencode", "hermes", "cursor"]),
+              help="Force a specific agent parser, overriding auto-detection")
 @click.option("--json-output", "json_out", is_flag=True, help="Output as JSON")
 @click.option("--quiet", "-q", is_flag=True, help="Suppress rich formatting and output JSON only")
-def week(days, date, log_paths, json_out, quiet=False):
+def week(days, date, log_paths, agent, json_out, quiet=False):
     """Show usage for the last N days ending on a specific date (default: today)."""
     from datetime import datetime, timedelta
     
-    usages = _parse_all_logs(list(log_paths) if log_paths else None)
+    usages = _parse_all_logs(list(log_paths) if log_paths else None, agent=agent)
     if date:
         end_date = datetime.strptime(date, "%Y-%m-%d") + timedelta(days=1)
         cutoff = end_date - timedelta(days=days)
@@ -316,15 +425,17 @@ def week(days, date, log_paths, json_out, quiet=False):
 @cli.command()
 @click.option("--path", "-p", "log_paths", multiple=True, type=click.Path(path_type=Path),
               help="Custom log paths")
+@click.option("--agent", "-a", default=None, type=click.Choice(["claude", "codex", "opencode", "hermes", "cursor"]),
+              help="Force a specific agent parser, overriding auto-detection")
 @click.option("--threshold", "-t", default=5.0, type=float, help="Alert threshold in USD")
 @click.option("--sarif", "as_sarif", is_flag=True, help="Output SARIF 2.1.0 (for GitHub Code Scanning)")
 @click.option("--quiet", "-q", is_flag=True, help="Suppress console messages (exit code only)")
-def alert(log_paths, threshold, as_sarif, quiet=False):
+def alert(log_paths, agent, threshold, as_sarif, quiet=False):
     """Check if spending exceeds threshold today."""
     validate_threshold(threshold, "--threshold")
     from datetime import datetime
     
-    usages = _parse_all_logs(list(log_paths) if log_paths else None)
+    usages = _parse_all_logs(list(log_paths) if log_paths else None, agent=agent)
     today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     usages = [u for u in usages if u.timestamp and u.timestamp >= today_start]
     

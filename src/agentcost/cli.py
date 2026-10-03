@@ -127,7 +127,7 @@ def cli():
 @cli.command()
 @click.option("--path", "-p", "log_paths", multiple=True, type=click.Path(path_type=Path),
               help="Log file paths or directories")
-@click.option("--agent", "-a", default=None, type=click.Choice(["claude", "codex", "opencode", "hermes"]),
+@click.option("--agent", "-a", default=None, type=click.Choice(["claude", "codex", "opencode", "hermes", "cursor"]),
               help="Filter by agent")
 @click.option("--quiet", "-q", is_flag=True, help="Only list log paths, one per line")
 def discover(log_paths, agent, quiet=False):

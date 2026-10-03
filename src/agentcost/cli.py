@@ -61,14 +61,19 @@ def _parse_all_logs(
                     if subpath.is_file() and subpath.suffix in (".jsonl", ".json", ".log"):
                         all_usages.extend(_parse_file(subpath, strict=strict, agent=agent))
     else:
-        # First, try SQLite database (Hermes agent)
-        sqlite_parser = HermesSQLiteParser()
-        all_usages.extend(sqlite_parser.parse())
+        # First, try SQLite database (Hermes agent). Only Hermes-shaped
+        # agent choices may read it, so `--agent codex` must not pull
+        # Hermes rows in behind the user's back.
+        if agent in (None, "hermes"):
+            sqlite_parser = HermesSQLiteParser()
+            all_usages.extend(sqlite_parser.parse())
 
         # Then discover other logs
         discovery = LogDiscovery()
         logs = discovery.discover()
         for agent_type, paths in logs.items():
+            if agent and agent_type != agent:
+                continue
             parser = _get_parser(agent_type)
             for path in paths:
                 if isinstance(parser, CursorParser):
@@ -91,9 +96,19 @@ _AGENT_FAMILY = {
     "hermes": "hermes",
 }
 
-# When structural detection disagrees with the path and there is no more
-# specific signal available, this maps a detected family back to a concrete
-# parser.
+# Concrete agents whose parser can read a given detected family. CursorParser
+# accepts both the message-wrapped and the top-level-usage shapes
+# (``entry.get("message", entry)``), so a ``cursor`` path hint is never wrong
+# about shape and is never overridden. Every other agent reads exactly one
+# shape, so content detection is free to correct a wrong hint.
+_COMPATIBLE = {
+    "claude": frozenset({"claude", "cursor"}),
+    "codex": frozenset({"codex", "opencode", "cursor"}),
+}
+
+# When structural detection disagrees with the path and the hinted parser
+# cannot read the detected shape, this maps a detected family back to a
+# concrete parser.
 _FAMILY_DEFAULT = {
     "claude": "claude",
     "codex": "codex",
@@ -163,9 +178,9 @@ def _resolve_parser_type(path: Path, explicit_agent: Optional[str] = None) -> st
     """Choose the parser type for a single log file.
 
     Priority: an explicit ``--agent`` flag, then structural content detection,
-    then the path-based heuristic. When structural detection disagrees with the
-    path heuristic, a warning is printed to stderr and structural detection
-    wins.
+    then the path-based heuristic. Content detection only overrides the path
+    hint when the hinted parser cannot read the detected shape; when they
+    disagree irreconcilably a warning is printed to stderr and content wins.
     """
     if explicit_agent:
         return explicit_agent
@@ -178,6 +193,11 @@ def _resolve_parser_type(path: Path, explicit_agent: Optional[str] = None) -> st
 
     if _AGENT_FAMILY.get(path_agent) == detected_family:
         # Same family — trust the more specific path hint (cursor vs claude).
+        return path_agent
+
+    if path_agent in _COMPATIBLE.get(detected_family, frozenset()):
+        # The hinted parser reads this shape too (Cursor accepts both), so the
+        # path hint stays and no warning is warranted.
         return path_agent
 
     print(

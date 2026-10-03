@@ -104,6 +104,11 @@ _AGENT_FAMILY = {
 _COMPATIBLE = {
     "claude": frozenset({"claude", "cursor"}),
     "codex": frozenset({"codex", "opencode", "cursor"}),
+    # HermesParser reads `usage` first and `tokens` second, so it reads both the
+    # Hermes and the top-level-usage shapes. Naming it here keeps a `hermes` path
+    # hint authoritative for both, instead of warning about a disagreement that
+    # the parser resolves anyway.
+    "hermes": frozenset({"hermes"}),
 }
 
 # When structural detection disagrees with the path and the hinted parser
@@ -129,20 +134,29 @@ def _classify_entry(entry) -> Optional[str]:
     """Classify one JSON log entry into a canonical agent family.
 
     Returns ``"claude"`` for message-wrapped usage (Claude/Cursor),
-    ``"codex"`` for top-level usage (Codex/OpenCode), ``"hermes"`` for the
-    Hermes message shape, or ``None`` when the format is unrecognised.
+    ``"codex"`` for top-level usage (Codex/OpenCode), ``"hermes"`` for
+    ``tokens``-shaped usage, or ``None`` when the format is unrecognised.
+
+    The Hermes branch keys on the parser contract rather than on content
+    markers. ``HermesParser`` reads ``entry.get("usage", entry.get("tokens",
+    {}))`` (``parsers.py``), so what makes an entry Hermes-shaped is *where the
+    usage lives*, and ``tokens`` without ``usage`` is the only shape
+    ``CodexParser`` cannot read. ``type``/``role``/``content`` are not Hermes
+    markers: ``openai/codex`` tags its rollout items with ``type`` and an
+    assistant message carries ``role`` and ``content``, so testing for them sent
+    genuine Codex entries to ``HermesParser``, which then read the same
+    top-level ``usage`` and reported them as ``hermes-agent`` with no model
+    normalisation -- a silently wrong cost rather than a missing one.
     """
     if not isinstance(entry, dict):
         return None
     message = entry.get("message")
     if isinstance(message, dict) and isinstance(message.get("usage"), dict):
         return "claude"
-    usage = entry.get("usage")
-    tokens = entry.get("tokens")
-    if isinstance(usage, dict) or isinstance(tokens, dict):
-        if "type" in entry or "role" in entry or "content" in entry:
-            return "hermes"
+    if isinstance(entry.get("usage"), dict):
         return "codex"
+    if isinstance(entry.get("tokens"), dict):
+        return "hermes"
     return None
 
 

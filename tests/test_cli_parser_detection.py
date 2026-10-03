@@ -106,6 +106,92 @@ class TestClassifyEntry:
         assert _classify_entry("not a dict") is None
 
 
+# `openai/codex` tags its rollout items with "type", and an assistant message also
+# carries "role" and "content". None of those keys is what makes an entry
+# Hermes-shaped: `parsers.py` reads Hermes usage as
+# `entry.get("usage", entry.get("tokens", {}))`, so the shape is defined by where
+# the usage lives. Classifying on the content markers sent a genuine Codex entry
+# to HermesParser, which read the same top-level `usage` and produced a usage
+# attributed to `hermes-agent` with no model normalisation -- a silently wrong
+# cost rather than a missing one.
+TYPED_CODEX_LINE = json.dumps({
+    "timestamp": "2026-10-03T12:00:00Z",
+    "type": "response_item",
+    "role": "assistant",
+    "content": [{"type": "output_text", "text": "hi"}],
+    "model": "gpt-4o-2024-08-06",
+    "usage": {"input_tokens": 100, "output_tokens": 50},
+})
+
+
+class TestTypedCodexEntry:
+    """A Codex rollout item carrying `type`/`role`/`content` is still Codex."""
+
+    def test_classifies_as_codex(self):
+        assert _classify_entry(json.loads(TYPED_CODEX_LINE)) == "codex"
+
+    def test_parses_as_codex_not_hermes(self, tmp_path):
+        path = tmp_path / "codex-session.jsonl"
+        path.write_text(TYPED_CODEX_LINE + "\n")
+        usages = _parse_file(path)
+        assert usages
+        assert all(u.agent_id == "codex-cli" for u in usages)
+
+    def test_codex_path_does_not_warn(self, tmp_path, capsys):
+        """A Codex entry on a Codex path agrees with itself; no warning."""
+        path = tmp_path / "codex-session.jsonl"
+        path.write_text(TYPED_CODEX_LINE + "\n")
+        _parse_file(path)
+        assert "Warning" not in capsys.readouterr().err
+
+    def test_model_normalisation_survives(self, tmp_path):
+        """`codex-cli` normalisation is what keeps the cost right.
+
+        HermesParser passes the raw model through, so `gpt-4o-2024-08-06` misses
+        MODEL_PRICING and falls back to the 1.0/3.0 default -- roughly a third
+        of the real price, silently.
+        """
+        from agentcost.cost import calculate_cost
+
+        path = tmp_path / "codex-session.jsonl"
+        path.write_text(TYPED_CODEX_LINE + "\n")
+        usage = _parse_file(path)[0]
+        assert usage.model == "gpt-4o"
+        # gpt-4o: 2.5/10.0 per MTok on 100 input + 50 output.
+        assert round(calculate_cost(usage), 8) == round(100 * 2.5e-6 + 50 * 10e-6, 8)
+
+    def test_typed_codex_in_claude_path_is_codex(self, tmp_path):
+        """The typed shape must still lose to a wrong path hint."""
+        path = tmp_path / "claude-session.jsonl"
+        path.write_text(TYPED_CODEX_LINE + "\n")
+        usages = _parse_file(path)
+        assert usages
+        assert all(u.agent_id == "codex-cli" for u in usages)
+
+
+class TestHermesUsageShape:
+    """`usage` before `tokens`: an entry with both is Codex, `tokens` alone is Hermes."""
+
+    def test_usage_wins_over_tokens(self):
+        entry = {"usage": {"input_tokens": 1, "output_tokens": 1},
+                 "tokens": {"input_tokens": 2, "output_tokens": 2}}
+        assert _classify_entry(entry) == "codex"
+
+    def test_tokens_alone_is_hermes(self):
+        entry = {"tokens": {"input_tokens": 1, "output_tokens": 1}}
+        assert _classify_entry(entry) == "hermes"
+
+    def test_hermes_shape_in_codex_path_stays_hermes(self, tmp_path):
+        """A `tokens` entry is Hermes even without the content markers."""
+        entry = {"timestamp": "2026-10-03T12:00:00Z", "model": "hermes-4",
+                 "tokens": {"input_tokens": 100, "output_tokens": 50}}
+        path = tmp_path / "codex-session.jsonl"
+        path.write_text(json.dumps(entry) + "\n")
+        usages = _parse_file(path)
+        assert usages
+        assert all(u.agent_id == "hermes-agent" for u in usages)
+
+
 class TestEdgeCases:
     def test_empty_file_falls_back_to_path(self, tmp_path):
         """An empty file has no detectable format and must not raise."""

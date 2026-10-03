@@ -49,11 +49,71 @@ def project_name() -> str:
     return name.group(1)
 
 
-def install_name(readme: str) -> str:
-    """The distribution name the README tells people to install."""
-    match = re.search(r"pip(?:3)?\s+install\s+([A-Za-z0-9._-]+)", readme)
-    assert match, "README has no `pip install <name>` line"
-    return match.group(1)
+# `pip install <target>`; the remainder of the line is parsed token by token so
+# the two install forms stay distinguishable: a registry name is a bare
+# distribution, a VCS/URL install carries a scheme and a URL.
+INSTALL_LINE = re.compile(r"pip(?:3)?\s+install\s+(?P<rest>\S.*)$", re.MULTILINE)
+
+# A VCS install names no distribution on the command line -- pip reads the name
+# out of the cloned project's metadata. `git+https://`, `git+ssh://`, `hg+`,
+# `svn+`, ... all land here, and so does any `<scheme>+<url>` form.
+#
+# The scheme is matched on `+`, not on a list of version-control names: `+` is
+# not a legal character in a distribution name (PEP 508 names are letters,
+# digits, `.`, `-` and `_`), so its presence in the target cannot be a registry
+# name. Treating a leading `git` as if it were the distribution is what made this
+# guard compare 'git' with 'agentcost-py'.
+VCS_INSTALL = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*\+")
+
+# Long pip options that consume the following token, so it is an option value
+# and not the install target.
+OPTIONS_WITH_VALUE = frozenset({
+    "--abi", "--cert", "--client-cert", "--config-settings", "--constraint",
+    "--editable", "--find-links", "--fingerprint", "--hash", "--implementation",
+    "--index-url", "--install-option", "--keyring-provider", "--log",
+    "--no-binary", "--only-binary", "--platform", "--prefix", "--proxy",
+    "--python-version", "--requirement", "--retries", "--root", "--src",
+    "--target", "--timeout", "--trusted-host", "--upgrade-strategy", "--user",
+})
+
+
+def install_target(readme: str) -> str:
+    """The first thing after `pip install`, skipping pip options and their values."""
+    match = INSTALL_LINE.search(readme)
+    assert match, "README has no `pip install <target>` line"
+    tokens = match.group("rest").split()
+    skip_value = False
+    for token in tokens:
+        if skip_value:
+            skip_value = False
+            continue
+        if token in OPTIONS_WITH_VALUE:
+            skip_value = True
+            continue
+        if token.startswith("-"):
+            continue
+        return token.rstrip("\\")
+    raise AssertionError(f"`pip install {' '.join(tokens)}` names no install target")
+
+
+def install_name(readme: str) -> str | None:
+    """The distribution name the README tells people to install.
+
+    Returns the bare name for a registry install, and `None` for a VCS/URL
+    install: there is no distribution name on that command line to compare, so
+    callers must check the URL with `install_url` instead.
+    """
+    target = install_target(readme)
+    return None if VCS_INSTALL.match(target) or "://" in target else target
+
+
+def install_url(readme: str) -> str:
+    """The clone target of a VCS install, e.g. `git+https://host/owner/repo.git`."""
+    target = install_target(readme)
+    assert VCS_INSTALL.match(target) or "://" in target, (
+        f"install target {target!r} is not a VCS or URL install"
+    )
+    return target
 
 
 @pytest.fixture(scope="module")
@@ -61,9 +121,79 @@ def readme() -> str:
     return read(README)
 
 
+def project_homepage() -> str:
+    """`[project.urls] Homepage` — the authoritative repo location.
+
+    Derived rather than hardcoded so a fork or a rename updates the guard on its
+    own; a stale `yunaremaia/agentcost` literal would itself be a lie.
+    """
+    text = read(PYPROJECT)
+    match = re.search(r'^\s*Homepage\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
+    assert match, "no [project.urls] Homepage in pyproject.toml"
+    return match.group(1).rstrip("/")
+
+
+def install_name_matches_pyproject(readme: str) -> None:
+    """(d) The install line must resolve to this distribution.
+
+    Two shapes, both checked:
+
+    * registry install -- the name on the command line must be `[project] name`,
+      exactly as strict as before;
+    * VCS install -- there is no distribution name to compare, so the clone URL
+      must point at this repository (from `[project.urls] Homepage`). A pasted
+      URL for the wrong project fails here.
+    """
+    name = install_name(readme)
+    if name is not None:
+        assert name == project_name(), (
+            f"README installs {name!r} but [project] name is {project_name()!r}"
+        )
+        return
+    url = install_url(readme)
+    homepage = project_homepage()
+    assert homepage in url, (
+        f"README installs from {url!r}, which is not this repository "
+        f"({homepage})"
+    )
+
+
 def test_readme_install_name_matches_pyproject(readme: str) -> None:
     """(d) The install line and [project] name must be the same distribution."""
-    assert install_name(readme) == project_name()
+    install_name_matches_pyproject(readme)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "pip install git+https://github.com/yunaremaia/agentcost.git",
+        "pip install git+ssh://git@github.com/yunaremaia/agentcost.git",
+        "pip3 install hg+https://example.invalid/agentcost",
+        "pip install svn+https://example.invalid/agentcost",
+        "pip install bzr+https://example.invalid/agentcost",
+        "pip install -e git+https://github.com/yunaremaia/agentcost.git",
+    ],
+)
+def test_vcs_install_is_recognised_as_a_url_not_a_name(line: str) -> None:
+    """A `<scheme>+<url>` target is a clone URL, never the distribution `git`.
+
+    Locked with a synthetic README so the behaviour is tested without depending
+    on the real file's install line.
+    """
+    synthetic = f"# agentcost\n\n## Install\n\n```bash\n{line}\n```\n"
+    assert install_name(synthetic) is None, (
+        f"{line!r} was read as the distribution "
+        f"{install_name(synthetic)!r} instead of a VCS install"
+    )
+    assert install_url(synthetic) == line.split()[-1]
+
+
+def test_registry_install_still_returns_the_bare_name() -> None:
+    """The registry form keeps the strict name comparison, not the URL branch."""
+    synthetic = "# agentcost\n\n## Install\n\n```bash\npip install agentcost-py\n```\n"
+    assert install_name(synthetic) == "agentcost-py"
+    with pytest.raises(AssertionError):
+        install_url(synthetic)
 
 
 def test_readme_does_not_advertise_the_conflicting_short_name(readme: str) -> None:

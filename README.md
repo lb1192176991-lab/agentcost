@@ -11,11 +11,13 @@
 ## Install
 
 ```bash
-pip install agentcost-py
+pip install git+https://github.com/yunaremaia/agentcost.git
 ```
 
-> **Package name:** the short PyPI name `agentcost` belongs to a different
-> project, not this one. Install `agentcost-py` as shown above.
+> **Not on PyPI yet.** The distribution is named `agentcost-py` to avoid the
+> short PyPI name `agentcost`, which belongs to a different project by a
+> different author. The trusted-publisher upload is still pending, so install
+> from Git for now — `pip install agentcost-py` does not resolve yet.
 
 ## Quick Start
 
